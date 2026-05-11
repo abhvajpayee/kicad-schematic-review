@@ -1,53 +1,69 @@
 # kicad-schematic-review
 
-A KiCad schematic parser and design-rule checker. Parses `.kicad_sch` hierarchies into a flat JSON netlist and runs five automated checks, grouped by sheet.
+A KiCad schematic parser and design-rule checker. Uses `kicad-cli` as the authoritative connectivity source and runs five automated DRC checks, grouped by sheet.
+
+## Requirements
+
+- Python 3.7+, no third-party packages
+- KiCad 7+ with `kicad-cli` on PATH (used for netlist export)
 
 ## What it does
 
 **`parse_schematic.py`** — parser and public API
 
-Traverses a full KiCad schematic hierarchy (root sheet + all sub-sheets), resolves wire connectivity via coordinate-based union-find, and produces a JSON netlist:
+Runs `kicad-cli sch export netlist` to get the authoritative netlist, then parses `.kicad_sch` files only for supplemental component metadata. Produces a flat JSON netlist:
 
 ```json
 {
   "nets": {
-    "GND": [{"ref": "C1", "pin": "2", "pin_name": "", "pin_type": "passive"}, ...],
-    "__NC__":  [...],
-    "__FNC__": [...]
+    "GND":             [{"ref": "C1", "pin": "2", "pin_name": "", "pin_type": "passive"}, ...],
+    "Net-(U10-MDC)":   [{"ref": "R130", "pin": "1", ...}, {"ref": "U10", "pin": "13", ...}],
+    "__NC__":          [...],
+    "__FNC__":         [...]
   },
   "components": {
-    "U1": {
-      "value": "STM32MP135D",
-      "footprint": "Package_BGA:BGA-448",
-      "sheet": "STM32MP1_Processor.kicad_sch",
-      "description": "...",
-      "datasheet": "...",
-      "properties": {"MPN": "...", "Manufacturer": "..."}
+    "U10": {
+      "value":       "RTL8211F-CG",
+      "footprint":   "RTL8211F-CG:QFN40P500X500X90-41N",
+      "sheet":       "Ethernet.kicad_sch",
+      "description": "GbE PHY with RGMII interface",
+      "datasheet":   "",
+      "properties":  {"MANUFACTURER": "Realtek", "MP": "RTL8211F-CG", ...}
     }
   }
 }
 ```
+
+**Net name conventions** after path-prefix stripping:
+
+| KiCad netlist name | Output name | Meaning |
+|---|---|---|
+| `/GND` | `GND` | Global net |
+| `/Ethernet/ETH0_7` | `ETH0_7` | Local net in Ethernet sheet |
+| `Net-(U10-MDC)` | `Net-(U10-MDC)` | Unnamed net, anchored to U10 MDC pin |
+| `unconnected-(U10-RSET-Pad39)` | `__NC__` | Truly floating (no connection) |
+| pintype `input+no_connect` | `__FNC__` | Explicit no-connect marker placed by designer |
 
 **`review_schematic.py`** — design-rule checker
 
 Runs five checks and reports findings grouped by sheet:
 
 | Check | What it catches |
-|-------|----------------|
-| Floating inputs | `input` pins with no wire attached |
-| Undriven nets | Nets with no output/bidirectional driver |
-| Single-pin nets | Named net connected to only one pin (dangling wire) |
+|---|---|
+| Floating inputs | `input` pins classified `__NC__` or `__FNC__` |
+| Undriven nets | Named nets with no output/bidirectional driver |
+| Single-pin nets | Named net connected to exactly one pin (dangling label) |
 | Missing footprint | BOM component with no footprint assigned |
-| Duplicate references | Same ref designator on different components across sheets (auto-renamed) |
+| Duplicate references | Same ref designator across multiple sheets (auto-renamed) |
 
 ## Usage
 
 ```bash
-# Parse a schematic to JSON (auto-detects root sheet from directory)
+# Parse to JSON (auto-detects root sheet)
 python parse_schematic.py STM32MP1/
 python parse_schematic.py STM32MP1/STM32MP1.kicad_sch --output netlist.json
 
-# Run the design-rule checker
+# Design-rule check
 python review_schematic.py STM32MP1/ --format text
 python review_schematic.py STM32MP1/ --output report.json
 ```
@@ -57,10 +73,7 @@ python review_schematic.py STM32MP1/ --output report.json
 ```python
 from parse_schematic import parse_kicad_sch
 
-netlist = parse_kicad_sch("path/to/design/")
-# or
-netlist = parse_kicad_sch("path/to/root.kicad_sch")
-
+netlist    = parse_kicad_sch("path/to/design/")
 nets       = netlist["nets"]        # {net_name: [{ref, pin, pin_name, pin_type}]}
 components = netlist["components"]  # {ref: {value, footprint, sheet, ...}}
 ```
@@ -74,22 +87,26 @@ print(format_text_report(report))
 
 ## Implementation notes
 
-### Coordinate system
-KiCad lib_symbols use a Y-up coordinate system while schematics use Y-down. Pin positions from lib_symbols have their Y coordinate negated before transformation to schematic coordinates. Getting this wrong silently swaps power supply and GND connections.
+### Connectivity source
 
-### Wire connectivity
-Labels and pins connect to wires at any point along the wire — not just at endpoints. Each connection point is checked against all wire segments (`_on_segment`) and unioned into the same connected component if it lies on any wire.
+All net connectivity comes from `kicad-cli sch export netlist --format kicadsexpr`. This is the same data KiCad's own ERC and PCB import use — cross-sheet hierarchical connections, bus members, and power nets are all resolved by KiCad itself.
+
+The `.kicad_sch` files are parsed only for supplemental context:
+- Component descriptions and custom properties (MPN, manufacturer) that may be richer in the schematic
+- Duplicate-reference detection (scanning per-sheet symbol instances to find refs that appear on more than one sheet)
+
+### Why not wire-trace from .kicad_sch?
+
+The previous version used coordinate-based union-find to trace wires, labels, and bus connections directly from the schematic files. This required handling KiCad's Y-up/Y-down coordinate system, midpoint label connections, hierarchical bus member resolution, and unlabeled wire segment naming — and still produced false NC reports for connected-but-unlabeled wire segments. kicad-cli eliminates all of that: it gives every net a name, correctly handles all connection types, and is the authoritative ground truth.
 
 ### Duplicate reference disambiguation
-When the same reference designator appears on components in different sheets (annotation error), the ref is automatically prefixed with the sheet name: `C1` in `wifi.kicad_sch` becomes `wifi_C1`, `C1` in `DDR3_RAM.kicad_sch` becomes `DDR3_RAM_C1`. Both appear as distinct entries in the netlist.
 
-### Known limitation — bus hierarchical connections
-Nets connected through hierarchical bus sheet pins (e.g. `DDR_DQ[0..15]` spanning processor and memory sheets) are not merged when the bus member names differ between sheets (`DQ0` vs `DDR_DQ0`). These appear as single-pin nets in the output and produce false-positive warnings in the reviewer. Cross-sheet bus members with matching names (via global labels) are merged correctly.
+When the same reference designator appears on different components in different sheets (annotation error), the ref is prefixed with the sheet name: `C1` in `wifi.kicad_sch` → `wifi_C1`, `C1` in `DDR3_RAM.kicad_sch` → `DDR3_RAM_C1`. Both appear as distinct entries in the netlist.
 
-## Requirements
+### Pin name extraction
 
-Python 3.7+ — no external dependencies.
+kicad-cli encodes pin names as `NAME_PINNUM` in the `pinfunction` field (e.g. `MDC_13`, `NRST_CORE_R1`). The parser strips the trailing `_<pin_number>` suffix to recover the clean pin name (`MDC`, `NRST_CORE`).
 
 ## Claude Code skill
 
-The `.claude/skills/review-schematic/SKILL.md` file registers this as a Claude Code skill. When invoked as `/review-schematic`, Claude runs the checker and presents the findings with severity ratings and suggested actions.
+`.claude/skills/review-schematic/SKILL.md` registers this as a Claude Code skill. Invoke as `/review-schematic` to run the checker, fetch datasheets for flagged ICs, and get datasheet-backed fix recommendations per finding.

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-parse_schematic.py - Parse KiCad .kicad_sch schematics into a JSON netlist.
+parse_schematic.py - Parse KiCad schematics into a JSON netlist.
 
-Traverses the full sheet hierarchy starting from a root .kicad_sch file,
-resolves wire connectivity, and emits a flat JSON netlist with rich per-pin
-context (pin type, pin name, footprint, etc.).
+Connectivity is obtained authoritatively from kicad-cli:
+    kicad-cli sch export netlist --format kicadsexpr
+
+The .kicad_sch files are parsed only for supplemental context that is not
+available in the netlist: custom component properties, richer descriptions,
+and duplicate-reference detection.
 
 Usage:
     python parse_schematic.py <root.kicad_sch>
@@ -18,8 +21,8 @@ Output schema:
                 {"ref": "U1", "pin": "A3", "pin_name": "PA0", "pin_type": "bidirectional"},
                 ...
             ],
-            "__NC__":  [...],   # floating pins (no wire attached)
-            "__FNC__": [...]    # explicitly no-connected by designer
+            "__NC__":  [...],   # floating pins (no wire, net name starts 'unconnected-')
+            "__FNC__": [...]    # explicitly no-connected (pintype contains 'no_connect')
         },
         "components": {
             "U1": {
@@ -35,15 +38,16 @@ Output schema:
 """
 
 import json
-import math
 import os
-import re
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
+
 # ---------------------------------------------------------------------------
-# S-expression tokenizer / parser
+# S-expression tokenizer / parser  (used for both netlist and .kicad_sch)
 # ---------------------------------------------------------------------------
 
 def _tokenize(text: str) -> List[str]:
@@ -54,32 +58,26 @@ def _tokenize(text: str) -> List[str]:
         if c in ' \t\n\r':
             i += 1
         elif c == '(':
-            tokens.append('(')
-            i += 1
+            tokens.append('('); i += 1
         elif c == ')':
-            tokens.append(')')
-            i += 1
+            tokens.append(')'); i += 1
         elif c == '"':
             j = i + 1
             buf: List[str] = []
             while j < n:
                 if text[j] == '\\' and j + 1 < n:
-                    buf.append(text[j + 1])
-                    j += 2
+                    buf.append(text[j + 1]); j += 2
                 elif text[j] == '"':
-                    j += 1
-                    break
+                    j += 1; break
                 else:
-                    buf.append(text[j])
-                    j += 1
-            tokens.append('\x00' + ''.join(buf))  # \x00 prefix marks quoted strings
+                    buf.append(text[j]); j += 1
+            tokens.append('\x00' + ''.join(buf))
             i = j
         else:
             j = i
             while j < n and text[j] not in ' \t\n\r()':
                 j += 1
-            tokens.append(text[i:j])
-            i = j
+            tokens.append(text[i:j]); i = j
     return tokens
 
 
@@ -99,16 +97,12 @@ def _parse(tokens: List[str], pos: int) -> Tuple[list, int]:
 
 
 def _load(path: str) -> list:
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8', errors='replace') as f:
         text = f.read()
     tokens = _tokenize(text)
-    node, _ = _parse(tokens, 0)
-    return node
+    tree, _ = _parse(tokens, 0)
+    return tree
 
-
-# ---------------------------------------------------------------------------
-# S-expression navigation helpers
-# ---------------------------------------------------------------------------
 
 def _children(node: list, tag: str) -> List[list]:
     return [c for c in node if isinstance(c, list) and c and c[0] == tag]
@@ -121,618 +115,21 @@ def _child(node: list, tag: str) -> Optional[list]:
     return None
 
 
-def _val(node: list, tag: str, default=None):
+def _val(node: list, tag: str, default: str = '') -> str:
     c = _child(node, tag)
     return c[1] if c and len(c) > 1 else default
 
 
-def _flag(node: list, tag: str) -> bool:
-    return _child(node, tag) is not None
-
-
 # ---------------------------------------------------------------------------
-# Coordinate math
-# ---------------------------------------------------------------------------
-
-_PREC = 4  # decimal places; KiCad grid ≥ 0.0254 mm, so 4dp is safe
-
-
-def _key(x: float, y: float) -> Tuple[float, float]:
-    return (round(x, _PREC), round(y, _PREC))
-
-
-def _transform(lx: float, ly: float,
-               sx: float, sy: float, rot: float,
-               mirror_x: bool, mirror_y: bool) -> Tuple[float, float]:
-    """Map a lib-symbol-local pin tip to schematic global coordinates.
-
-    KiCad lib_symbols use a Y-up coordinate system (mathematical Y), but
-    schematics use Y-down (screen coordinates).  The Y axis must be negated
-    before rotation.  Mirror flags are also applied in lib-symbol space (before
-    Y-inversion).
-    """
-    # Mirror in lib-symbol space (before Y-inversion)
-    if mirror_x:
-        ly = -ly
-    if mirror_y:
-        lx = -lx
-    # Convert lib-symbol Y-up → schematic Y-down
-    ly = -ly
-    a = math.radians(rot)
-    cos_a, sin_a = math.cos(a), math.sin(a)
-    gx = sx + lx * cos_a + ly * sin_a
-    gy = sy - lx * sin_a + ly * cos_a
-    return _key(gx, gy)
-
-
-# ---------------------------------------------------------------------------
-# Union-Find
-# ---------------------------------------------------------------------------
-
-class _UF:
-    def __init__(self):
-        self._p: dict = {}
-
-    def ensure(self, x):
-        if x not in self._p:
-            self._p[x] = x
-
-    def find(self, x) -> object:
-        self.ensure(x)
-        while self._p[x] != x:
-            self._p[x] = self._p[self._p[x]]
-            x = self._p[x]
-        return x
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self._p[rb] = ra
-
-    def root(self, x):
-        return self.find(x)
-
-
-# ---------------------------------------------------------------------------
-# lib_symbols extraction
-# ---------------------------------------------------------------------------
-
-_PWR_PIN_TYPES = {'power_in', 'power_out', 'pwr'}
-
-
-def _is_power_lib_sym(sym: list) -> bool:
-    """True when the lib symbol is a power-only symbol (no BOM entry, all pwr pins)."""
-    if _val(sym, 'in_bom', 'yes') == 'yes':
-        return False
-    has_pin = False
-    for part in _children(sym, 'symbol'):
-        for pin in _children(part, 'pin'):
-            has_pin = True
-            pin_type = pin[1] if len(pin) > 1 else ''
-            if pin_type not in _PWR_PIN_TYPES:
-                return False
-    return has_pin
-
-
-def _extract_lib_symbols(sch: list) -> Dict[str, dict]:
-    """
-    Parse lib_symbols section.
-    Returns {lib_id: {'pins': {pin_num: {name, type, lx, ly}}, 'is_power': bool}}
-    Includes ALL pins from ALL sub-parts (unit 0 shared + unit N specific).
-    Hidden duplicate pins are included because they represent real PCB pads.
-    """
-    result: Dict[str, dict] = {}
-    lib_syms_node = _child(sch, 'lib_symbols')
-    if not lib_syms_node:
-        return result
-
-    for sym in _children(lib_syms_node, 'symbol'):
-        if len(sym) < 2 or not isinstance(sym[1], str):
-            continue
-        lib_id = sym[1]
-        is_power = _is_power_lib_sym(sym)
-        pins: Dict[str, dict] = {}
-
-        for part in _children(sym, 'symbol'):
-            for pin in _children(part, 'pin'):
-                # lib pins: ['pin', type, shape, ['at', x, y, angle], ['length', n], ...]
-                at = _child(pin, 'at')
-                if not at or len(at) < 3:
-                    continue
-                pin_type = pin[1] if len(pin) > 1 else 'unspecified'
-                lx, ly = float(at[1]), float(at[2])
-                pin_name_node = _child(pin, 'name')
-                pin_name = pin_name_node[1] if pin_name_node and len(pin_name_node) > 1 else ''
-                pin_num_node = _child(pin, 'number')
-                pin_num = pin_num_node[1] if pin_num_node and len(pin_num_node) > 1 else ''
-                if pin_num and pin_num not in pins:
-                    pins[pin_num] = {'name': pin_name, 'type': pin_type, 'lx': lx, 'ly': ly}
-
-        result[lib_id] = {'pins': pins, 'is_power': is_power}
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Symbol instance extraction
-# ---------------------------------------------------------------------------
-
-_STD_PROPS = {'Reference', 'Value', 'Footprint', 'Datasheet', 'Description',
-              'ki_keywords', 'ki_fp_filters', 'ki_description', 'Intersheetrefs'}
-_PWR_REF_PREFIXES = ('#PWR', '#FLG')
-
-
-def _extract_instances(sch: list) -> List[dict]:
-    """Return all symbol instances from a sheet node."""
-    instances = []
-    for sym in _children(sch, 'symbol'):
-        lib_id_node = _child(sym, 'lib_id')
-        if not lib_id_node:
-            continue
-        lib_id = lib_id_node[1]
-
-        at = _child(sym, 'at')
-        if not at or len(at) < 3:
-            continue
-        sx = float(at[1])
-        sy = float(at[2])
-        rot = float(at[3]) if len(at) > 3 else 0.0
-
-        mirror_node = _child(sym, 'mirror')
-        mirror_x = mirror_node is not None and len(mirror_node) > 1 and mirror_node[1] == 'x'
-        mirror_y = mirror_node is not None and len(mirror_node) > 1 and mirror_node[1] == 'y'
-
-        in_bom_node = _child(sym, 'in_bom')
-        in_bom = (in_bom_node[1] != 'no') if in_bom_node and len(in_bom_node) > 1 else True
-
-        # Authoritative reference comes from the instances path section
-        reference = None
-        inst_node = _child(sym, 'instances')
-        if inst_node:
-            for proj in _children(inst_node, 'project'):
-                for path_node in _children(proj, 'path'):
-                    ref = _val(path_node, 'reference')
-                    if ref:
-                        reference = ref
-                        break
-                if reference:
-                    break
-        if not reference:
-            for prop in _children(sym, 'property'):
-                if len(prop) > 2 and prop[1] == 'Reference':
-                    reference = prop[2]
-                    break
-        if not reference:
-            continue
-
-        value = description = datasheet = footprint = ''
-        custom: Dict[str, str] = {}
-        for prop in _children(sym, 'property'):
-            if len(prop) < 3:
-                continue
-            pname, pval = prop[1], prop[2]
-            if pname == 'Value':
-                value = pval
-            elif pname == 'Footprint':
-                footprint = pval
-            elif pname == 'Datasheet':
-                datasheet = pval
-            elif pname == 'Description':
-                description = pval
-            elif pname not in _STD_PROPS:
-                custom[pname] = pval
-
-        unit_node = _child(sym, 'unit')
-        unit = int(unit_node[1]) if unit_node and len(unit_node) > 1 else 1
-
-        instances.append({
-            'lib_id': lib_id, 'reference': reference,
-            'sx': sx, 'sy': sy, 'rot': rot,
-            'mirror_x': mirror_x, 'mirror_y': mirror_y,
-            'in_bom': in_bom, 'unit': unit,
-            'value': value, 'footprint': footprint,
-            'datasheet': datasheet, 'description': description,
-            'properties': custom,
-        })
-    return instances
-
-
-# ---------------------------------------------------------------------------
-# Wire / label / no-connect extraction
-# ---------------------------------------------------------------------------
-
-def _extract_wires(sch: list) -> List[Tuple]:
-    wires = []
-    for wire in _children(sch, 'wire'):
-        pts = _child(wire, 'pts')
-        if not pts:
-            continue
-        xys = _children(pts, 'xy')
-        if len(xys) < 2:
-            continue
-        p1 = _key(float(xys[0][1]), float(xys[0][2]))
-        p2 = _key(float(xys[1][1]), float(xys[1][2]))
-        wires.append((p1, p2))
-    return wires
-
-
-def _extract_labels(sch: list) -> List[dict]:
-    labels = []
-    for tag in ('label', 'global_label', 'hierarchical_label'):
-        for node in _children(sch, tag):
-            if len(node) < 2:
-                continue
-            name = node[1]
-            at = _child(node, 'at')
-            if not at or len(at) < 3:
-                continue
-            labels.append({
-                'kind': tag,
-                'name': name,
-                'pos': _key(float(at[1]), float(at[2])),
-            })
-    return labels
-
-
-def _extract_no_connects(sch: list) -> Set[Tuple]:
-    ncs: Set[Tuple] = set()
-    for nc in _children(sch, 'no_connect'):
-        at = _child(nc, 'at')
-        if at and len(at) >= 3:
-            ncs.add(_key(float(at[1]), float(at[2])))
-    return ncs
-
-
-def _extract_buses(sch: list) -> List[Tuple]:
-    """Extract bus wire segments — same coordinate format as regular wires."""
-    buses = []
-    for bus in _children(sch, 'bus'):
-        pts = _child(bus, 'pts')
-        if not pts:
-            continue
-        xys = _children(pts, 'xy')
-        if len(xys) < 2:
-            continue
-        buses.append((_key(float(xys[0][1]), float(xys[0][2])),
-                      _key(float(xys[1][1]), float(xys[1][2]))))
-    return buses
-
-
-def _extract_bus_entries(sch: list) -> List[Tuple]:
-    """
-    Extract bus_entry stubs as (bus_side, wire_side) pairs.
-    KiCad convention: 'at' = the point that touches the bus wire,
-    'at + size' = the point that touches the individual signal wire.
-    """
-    entries = []
-    for be in _children(sch, 'bus_entry'):
-        at = _child(be, 'at')
-        size = _child(be, 'size')
-        if not at or not size or len(at) < 3 or len(size) < 3:
-            continue
-        x, y = float(at[1]), float(at[2])
-        dx, dy = float(size[1]), float(size[2])
-        entries.append((_key(x, y), _key(x + dx, y + dy)))
-    return entries
-
-
-# ---------------------------------------------------------------------------
-# Bus member resolution
-# ---------------------------------------------------------------------------
-
-_BUS_RANGE_RE = re.compile(r'^(.+)\[(\d+)\.\.(\d+)\]$')
-
-
-def _parse_bus_label(name: str) -> Optional[Tuple[str, int, int]]:
-    """Parse "Base[low..high]" → (base, low, high), or None if not a bus name."""
-    m = _BUS_RANGE_RE.match(name)
-    if not m:
-        return None
-    return m.group(1), int(m.group(2)), int(m.group(3))
-
-
-def _label_bus_index(label_name: str, base: str, low: int, high: int) -> Optional[int]:
-    """
-    If label_name is a member of base[low..high], return its 0-based index.
-    Example: "DDR_DQ5" in "DDR_DQ[0..15]" → 5.
-    """
-    if not label_name.startswith(base):
-        return None
-    suffix = label_name[len(base):]
-    try:
-        num = int(suffix)
-        if low <= high and low <= num <= high:
-            return num - low
-        if low > high and high <= num <= low:
-            return low - num
-    except ValueError:
-        pass
-    return None
-
-
-def _compute_bus_member_maps(
-    labels: list,
-    buses: List[Tuple],
-    bus_entries: List[Tuple],
-    wire_uf: '_UF',
-    comp_names: dict,
-    comp_labels: dict,
-    wires: List[Tuple],
-) -> Dict[str, Dict[int, str]]:
-    """
-    For each hierarchical_label with a bus name (e.g. "DDR_DQ[0..15]"), find
-    which individual net name occupies each bus member index.
-
-    comp_labels carries ALL label names on each wire component, not just the
-    canonical one.  This lets us find a bus-indexed label (e.g. "DDR_CTRL2")
-    even when the canonical name for that wire is a functional alias (e.g.
-    "DDR_CKE") — a common pattern where designers annotate wires with both
-    forms for readability.
-
-    Returns: {hier_label_name → {member_index → canonical_net_name}}
-    """
-    # Build a bus-only union-find (buses + bus_entries as edges)
-    bus_uf = _UF()
-    for p1, p2 in buses:
-        bus_uf.ensure(p1)
-        bus_uf.ensure(p2)
-        bus_uf.union(p1, p2)
-    for bus_side, wire_side in bus_entries:
-        bus_uf.ensure(bus_side)
-        bus_uf.ensure(wire_side)
-        bus_uf.union(bus_side, wire_side)
-
-    # Connect hierarchical bus label positions to the bus UF
-    for lbl in labels:
-        if lbl['kind'] == 'hierarchical_label' and _parse_bus_label(lbl['name']):
-            _connect_point_to_wires(lbl['pos'], buses, bus_uf)
-
-    result: Dict[str, Dict[int, str]] = {}
-
-    for lbl in labels:
-        if lbl['kind'] != 'hierarchical_label':
-            continue
-        parsed = _parse_bus_label(lbl['name'])
-        if not parsed:
-            continue
-        base, low, high = parsed
-        pos = lbl['pos']
-        if pos not in bus_uf._p:
-            continue
-        bus_comp = bus_uf.root(pos)
-
-        member_map: Dict[int, str] = {}
-        for bus_side, wire_side in bus_entries:
-            if bus_uf.root(bus_side) != bus_comp:
-                continue
-            # wire_side is a wire endpoint — connect it into the wire UF and
-            # look up which net it belongs to
-            _connect_point_to_wires(wire_side, wires, wire_uf)
-            wire_root = wire_uf.root(wire_side)
-            info = comp_names.get(wire_root)
-            if not info:
-                continue
-            canonical = info[0]
-
-            # Try the canonical name first, then every other label on this
-            # wire.  This handles wires with dual annotations like
-            # DDR_CKE + DDR_CTRL2 on the same wire: the canonical name may
-            # be the functional one ("DDR_CKE") which carries no bus index,
-            # but one of the other labels ("DDR_CTRL2") does.
-            all_names = comp_labels.get(wire_root, [canonical])
-            idx = None
-            for name in [canonical] + [n for n in all_names if n != canonical]:
-                idx = _label_bus_index(name, base, low, high)
-                if idx is not None:
-                    break
-
-            if idx is not None:
-                member_map[idx] = canonical  # always store canonical net name
-
-        if member_map:
-            # Merge rather than overwrite: a single bus may span multiple
-            # hierarchical_label nodes (e.g. DDR_CTRL[0..14] appears on both
-            # the left and right sides of a wide BGA chip symbol).
-            if lbl['name'] in result:
-                result[lbl['name']].update(member_map)
-            else:
-                result[lbl['name']] = member_map
-
-    return result
-
-
-def _extract_sheet_refs(sch: list) -> List[dict]:
-    refs = []
-    for sheet in _children(sch, 'sheet'):
-        filename = None
-        for prop in _children(sheet, 'property'):
-            if len(prop) > 2 and prop[1] == 'Sheetfile':
-                filename = prop[2]
-                break
-        if not filename:
-            continue
-        pins = []
-        for pin in _children(sheet, 'pin'):
-            if len(pin) < 2:
-                continue
-            at = _child(pin, 'at')
-            if at and len(at) >= 3:
-                pins.append({'name': pin[1], 'pos': _key(float(at[1]), float(at[2]))})
-        refs.append({'filename': filename, 'pins': pins})
-    return refs
-
-
-# ---------------------------------------------------------------------------
-# Wire connectivity and net assignment (per sheet)
-# ---------------------------------------------------------------------------
-
-_LABEL_PRIORITY = {'global_label': 3, 'label': 2, 'hierarchical_label': 1}
-_SEG_TOL = 1e-3  # 1 µm: tolerance for point-on-segment checks
-
-
-def _on_segment(px: float, py: float,
-                ax: float, ay: float, bx: float, by: float) -> bool:
-    """True if (px, py) lies on the segment (ax,ay)→(bx,by) within _SEG_TOL."""
-    dx, dy = bx - ax, by - ay
-    len_sq = dx * dx + dy * dy
-    if len_sq < _SEG_TOL * _SEG_TOL:
-        return abs(px - ax) < _SEG_TOL and abs(py - ay) < _SEG_TOL
-    cross = (px - ax) * dy - (py - ay) * dx
-    if abs(cross) > _SEG_TOL * math.sqrt(len_sq):
-        return False
-    t = ((px - ax) * dx + (py - ay) * dy) / len_sq
-    return -_SEG_TOL <= t <= 1.0 + _SEG_TOL
-
-
-def _connect_point_to_wires(pos: Tuple, wires: List[Tuple], uf: '_UF'):
-    """Union pos with any wire segment it lies on (handles midpoint connections)."""
-    px, py = pos
-    uf.ensure(pos)
-    for w_p1, w_p2 in wires:
-        if _on_segment(px, py, w_p1[0], w_p1[1], w_p2[0], w_p2[1]):
-            uf.union(pos, w_p1)
-            return  # One segment match is enough
-
-
-def _resolve_nets(instances, lib_symbols, wires, labels, nc_positions):
-    """
-    Build wire graph, assign net names to pins, return per-pin data.
-
-    Returns list of:
-        {reference, pin_number, pin_name, pin_type, pos, net_name}
-    """
-    uf = _UF()
-
-    # Wire graph — connect wire endpoints
-    for p1, p2 in wires:
-        uf.ensure(p1)
-        uf.ensure(p2)
-        uf.union(p1, p2)
-
-    # Connect labels and NC positions to the wire graph (may be at midpoints)
-    for lbl in labels:
-        _connect_point_to_wires(lbl['pos'], wires, uf)
-    for pos in nc_positions:
-        _connect_point_to_wires(pos, wires, uf)
-
-    # Assign names to connected components.
-    # comp_names  → canonical name (highest-priority label, used for final net names)
-    # comp_labels → all label names on each component (used by bus member resolution
-    #               so it can find a bus-indexed name even when the canonical name is
-    #               a functional alias like "DDR_CKE" instead of "DDR_CTRL2")
-    comp_names: Dict[object, Tuple[str, int]] = {}
-    comp_labels: Dict[object, List[str]] = defaultdict(list)
-
-    for lbl in labels:
-        root = uf.root(lbl['pos'])
-        pri = _LABEL_PRIORITY.get(lbl['kind'], 0)
-        existing = comp_names.get(root)
-        if existing is None or pri > existing[1]:
-            comp_names[root] = (lbl['name'], pri)
-        comp_labels[root].append(lbl['name'])
-
-    # Power symbols: treat Value as a label at the pin position
-    for inst in instances:
-        ref = inst['reference']
-        if not any(ref.startswith(p) for p in _PWR_REF_PREFIXES):
-            lib_sym = lib_symbols.get(inst['lib_id'], {})
-            if not lib_sym.get('is_power', False):
-                continue
-        lib_sym = lib_symbols.get(inst['lib_id'], {})
-        for pin_def in lib_sym.get('pins', {}).values():
-            gpos = _transform(pin_def['lx'], pin_def['ly'],
-                              inst['sx'], inst['sy'], inst['rot'],
-                              inst['mirror_x'], inst['mirror_y'])
-            _connect_point_to_wires(gpos, wires, uf)
-            root = uf.root(gpos)
-            net_name = inst['value']
-            existing = comp_names.get(root)
-            if existing is None or 2 > existing[1]:
-                comp_names[root] = (net_name, 2)
-
-    # Resolve pins for non-power components
-    pin_data = []
-    seen_pins: Set[Tuple[str, str]] = set()
-
-    for inst in instances:
-        ref = inst['reference']
-        # Skip power symbols
-        if any(ref.startswith(p) for p in _PWR_REF_PREFIXES):
-            continue
-        lib_sym = lib_symbols.get(inst['lib_id'], {})
-        if lib_sym.get('is_power', False):
-            continue
-
-        for pin_num, pin_def in lib_sym.get('pins', {}).items():
-            dedup_key = (ref, pin_num)
-            if dedup_key in seen_pins:
-                continue
-            seen_pins.add(dedup_key)
-
-            gpos = _transform(pin_def['lx'], pin_def['ly'],
-                              inst['sx'], inst['sy'], inst['rot'],
-                              inst['mirror_x'], inst['mirror_y'])
-            _connect_point_to_wires(gpos, wires, uf)
-            root = uf.root(gpos)
-
-            if gpos in nc_positions:
-                net_name = '__FNC__'
-            else:
-                info = comp_names.get(root)
-                net_name = info[0] if info else '__NC__'
-
-            pin_data.append({
-                'reference': ref,
-                'pin_number': pin_num,
-                'pin_name': pin_def['name'],
-                'pin_type': pin_def['type'],
-                'pos': gpos,
-                'net_name': net_name,
-            })
-
-    return pin_data, uf, comp_names, comp_labels
-
-
-# ---------------------------------------------------------------------------
-# Parse a single sheet file
-# ---------------------------------------------------------------------------
-
-def _parse_sheet(path: str, sheet_name: str) -> dict:
-    sch = _load(path)
-    lib_syms = _extract_lib_symbols(sch)
-    instances = _extract_instances(sch)
-    wires = _extract_wires(sch)
-    buses = _extract_buses(sch)
-    bus_entries = _extract_bus_entries(sch)
-    labels = _extract_labels(sch)
-    nc_positions = _extract_no_connects(sch)
-    sheet_refs = _extract_sheet_refs(sch)
-    pin_data, wire_uf, comp_names, comp_labels = _resolve_nets(
-        instances, lib_syms, wires, labels, nc_positions)
-    bus_member_maps = _compute_bus_member_maps(
-        labels, buses, bus_entries, wire_uf, comp_names, comp_labels, wires)
-
-    return {
-        'path': os.path.abspath(path),
-        'sheet_name': sheet_name,
-        'instances': instances,
-        'lib_symbols': lib_syms,
-        'pin_data': pin_data,
-        'sheet_refs': sheet_refs,
-        'buses': buses,
-        'bus_entries': bus_entries,
-        'bus_member_maps': bus_member_maps,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Root sheet auto-detection
+# Root-sheet auto-detection
 # ---------------------------------------------------------------------------
 
 def _find_root(directory: str) -> Optional[str]:
     """Return the root .kicad_sch file (the one not referenced by any other)."""
     sch_files = [
         f for f in os.listdir(directory)
-        if f.endswith('.kicad_sch') and not f.endswith('.kicad_sch-bak')
+        if f.endswith('.kicad_sch') and not f.startswith('_autosave')
+        and not f.endswith('.kicad_sch-bak')
     ]
     if not sch_files:
         return None
@@ -756,10 +153,93 @@ def _find_root(directory: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Hierarchy traversal
+# Schematic traversal — context only (no wire tracing)
 # ---------------------------------------------------------------------------
 
+_PWR_PREFIXES = ('#PWR', '#FLG')
+_STD_PROPS = {'Reference', 'Value', 'Footprint', 'Datasheet', 'Description',
+              'ki_keywords', 'ki_fp_filters', 'ki_description', 'Intersheetrefs',
+              'Sheetname', 'Sheetfile'}
+
+
+def _extract_instances_from_sch(sch: list, sheet_name: str) -> List[dict]:
+    """Extract component instances from a parsed .kicad_sch for context only."""
+    instances = []
+    for sym in _children(sch, 'symbol'):
+        lib_id_node = _child(sym, 'lib_id')
+        if not lib_id_node:
+            continue
+
+        # Resolve authoritative reference from instances/path section
+        reference = None
+        inst_node = _child(sym, 'instances')
+        if inst_node:
+            for proj in _children(inst_node, 'project'):
+                for path_node in _children(proj, 'path'):
+                    ref = _val(path_node, 'reference')
+                    if ref:
+                        reference = ref
+                        break
+                if reference:
+                    break
+        if not reference:
+            for prop in _children(sym, 'property'):
+                if len(prop) > 2 and prop[1] == 'Reference':
+                    reference = prop[2]
+                    break
+        if not reference or any(reference.startswith(p) for p in _PWR_PREFIXES):
+            continue
+
+        unit_node = _child(sym, 'unit')
+        unit = int(unit_node[1]) if unit_node and len(unit_node) > 1 else 1
+
+        value = description = datasheet = footprint = ''
+        custom: Dict[str, str] = {}
+        for prop in _children(sym, 'property'):
+            if len(prop) < 3:
+                continue
+            pname, pval = prop[1], prop[2]
+            if pname == 'Value':
+                value = pval
+            elif pname == 'Footprint':
+                footprint = pval
+            elif pname == 'Datasheet':
+                datasheet = pval
+            elif pname == 'Description':
+                description = pval
+            elif pname not in _STD_PROPS:
+                custom[pname] = pval
+
+        instances.append({
+            'reference': reference,
+            'unit': unit,
+            'value': value,
+            'footprint': footprint,
+            'description': description,
+            'datasheet': datasheet,
+            'properties': custom,
+            'sheet_name': sheet_name,
+        })
+    return instances
+
+
+def _extract_sheet_refs(sch: list) -> List[str]:
+    """Return child sheet filenames referenced from this sheet."""
+    filenames = []
+    for sheet in _children(sch, 'sheet'):
+        for prop in _children(sheet, 'property'):
+            if len(prop) > 2 and prop[1] == 'Sheetfile':
+                filenames.append(prop[2])
+    return filenames
+
+
 def _traverse(root_path: str) -> List[dict]:
+    """
+    Walk the schematic hierarchy and collect per-sheet context.
+
+    Returns a list of sheet dicts, each with:
+        path, sheet_name, instances (metadata only — no pin/wire data)
+    """
     all_sheets: List[dict] = []
     visited: Set[str] = set()
 
@@ -768,13 +248,22 @@ def _traverse(root_path: str) -> List[dict]:
         if abs_path in visited:
             return
         visited.add(abs_path)
-        data = _parse_sheet(path, sheet_name)
-        all_sheets.append(data)
+        try:
+            sch = _load(abs_path)
+        except Exception as e:
+            print(f'Warning: could not read {path}: {e}', file=sys.stderr)
+            return
+        instances = _extract_instances_from_sch(sch, sheet_name)
+        all_sheets.append({
+            'path': abs_path,
+            'sheet_name': sheet_name,
+            'instances': instances,
+        })
         base = os.path.dirname(abs_path)
-        for ref in data['sheet_refs']:
-            child_path = os.path.join(base, ref['filename'])
+        for filename in _extract_sheet_refs(sch):
+            child_path = os.path.join(base, filename)
             if os.path.exists(child_path):
-                child_name = os.path.splitext(ref['filename'])[0]
+                child_name = os.path.splitext(filename)[0]
                 _visit(child_path, child_name)
 
     root_name = os.path.splitext(os.path.basename(root_path))[0]
@@ -783,209 +272,296 @@ def _traverse(root_path: str) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Build final JSON structure
+# Duplicate-reference detection
 # ---------------------------------------------------------------------------
 
-def _make_rename_map(all_sheets: List[dict]) -> Dict[tuple, str]:
+def _make_rename_map(all_sheets: List[dict]) -> Dict[Tuple, str]:
     """
-    Build a rename map for references that are duplicated across sheets.
+    Build a rename map for references duplicated across sheets.
 
-    When the same (ref, unit) pair appears in more than one sheet, it means
-    two physically distinct components share a reference designator — a
-    schematic annotation error.  We disambiguate by prepending the sheet name:
-    C1 in DDR3_RAM → DDR3_RAM_C1, C1 in wifi → wifi_C1.
-
-    Returns: {(original_ref, sheet_name): disambiguated_ref}
+    Returns {(original_ref, sheet_name): disambiguated_ref}
     """
-    ref_unit_sheets: Dict[tuple, List[str]] = defaultdict(list)
+    ref_unit_sheets: Dict[Tuple, List[str]] = defaultdict(list)
 
     for sheet in all_sheets:
         sheet_name = sheet['sheet_name']
-        seen_in_sheet: Set[tuple] = set()
-        lib_syms = sheet['lib_symbols']
+        seen: Set[Tuple] = set()
         for inst in sheet['instances']:
-            ref = inst['reference']
-            if any(ref.startswith(p) for p in _PWR_REF_PREFIXES):
-                continue
-            lib_sym = lib_syms.get(inst['lib_id'], {})
-            if lib_sym.get('is_power', False):
-                continue
-            unit = inst.get('unit', 1)
-            key = (ref, unit)
-            if key not in seen_in_sheet:
+            key = (inst['reference'], inst['unit'])
+            if key not in seen:
                 ref_unit_sheets[key].append(sheet_name)
-                seen_in_sheet.add(key)
+                seen.add(key)
 
-    rename: Dict[tuple, str] = {}
+    rename: Dict[Tuple, str] = {}
     for (ref, unit), sheet_names in ref_unit_sheets.items():
-        unique_sheets = list(dict.fromkeys(sheet_names))  # preserve order, deduplicate
-        if len(unique_sheets) <= 1:
+        unique = list(dict.fromkeys(sheet_names))
+        if len(unique) <= 1:
             continue
-        for sname in unique_sheets:
-            # Sanitise sheet name: keep alphanumerics and underscores
+        for sname in unique:
             prefix = ''.join(c if c.isalnum() or c == '_' else '_' for c in sname)
             rename[(ref, sname)] = f'{prefix}_{ref}'
-
     return rename
 
 
-def _build_netlist(all_sheets: List[dict]) -> dict:
-    rename = _make_rename_map(all_sheets)
+# ---------------------------------------------------------------------------
+# kicad-cli netlist export
+# ---------------------------------------------------------------------------
 
-    nets: Dict[str, List[dict]] = {}
+def _export_netlist(root_sch_path: str) -> str:
+    """
+    Run kicad-cli to export a KiCad s-expression netlist.
+
+    Returns the path to the generated netlist file.
+    Raises RuntimeError if kicad-cli fails.
+    """
+    fd, netlist_path = tempfile.mkstemp(suffix='.net', prefix='kicad_netlist_')
+    os.close(fd)
+    cmd = [
+        'kicad-cli', 'sch', 'export', 'netlist',
+        '--format', 'kicadsexpr',
+        '--output', netlist_path,
+        root_sch_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            'kicad-cli not found. Install KiCad and ensure kicad-cli is on PATH.'
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('kicad-cli timed out after 120 s')
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'kicad-cli failed (exit {result.returncode}):\n{result.stderr}'
+        )
+    return netlist_path
+
+
+# ---------------------------------------------------------------------------
+# KiCad netlist parser
+# ---------------------------------------------------------------------------
+
+def _strip_pin_num(pinfunction: str, pin_number: str) -> str:
+    """Extract pin name from pinfunction field (format: 'NAME_PINNUM')."""
+    if not pinfunction or not pin_number:
+        return pinfunction
+    suffix = '_' + pin_number
+    if pinfunction.endswith(suffix):
+        return pinfunction[:-len(suffix)]
+    return pinfunction
+
+
+def _normalize_net_name(name: str) -> str:
+    """
+    Strip KiCad hierarchical path prefix from net names.
+
+    /GND             → GND
+    /Ethernet/ETH0_7 → ETH0_7
+    Net-(U10-MDC)    → Net-(U10-MDC)   (unchanged, no leading /)
+    """
+    if name.startswith('/'):
+        return name.rsplit('/', 1)[-1]
+    return name
+
+
+def _parse_kicad_netlist(netlist_path: str, rename: Dict[Tuple, str]) -> dict:
+    """
+    Parse a KiCad s-expression netlist into the standard output schema.
+
+    rename: {(original_ref, sheet_name): new_ref} from _make_rename_map.
+            Used to apply the same disambiguation as the schematic traversal.
+    """
+    nl = _load(netlist_path)
+
+    # Build ref → sheet_name from the components section (for rename lookup)
+    ref_to_sheet: Dict[str, str] = {}
+    comp_meta: Dict[str, dict] = {}
+
+    comps_node = _child(nl, 'components')
+    seen_refs: Dict[str, int] = defaultdict(int)
+
+    if comps_node:
+        for comp in _children(comps_node, 'comp'):
+            ref_node = _child(comp, 'ref')
+            if not ref_node or len(ref_node) < 2:
+                continue
+            orig_ref = ref_node[1]
+            seen_refs[orig_ref] += 1
+
+            val_node = _child(comp, 'value')
+            value = val_node[1] if val_node and len(val_node) > 1 else ''
+
+            desc_node = _child(comp, 'description')
+            description = desc_node[1] if desc_node and len(desc_node) > 1 else ''
+
+            # Sheetfile and Sheetname from property nodes
+            sheetfile = ''
+            sheetname = ''
+            footprint = ''
+            datasheet = ''
+            custom: Dict[str, str] = {}
+
+            for prop in _children(comp, 'property'):
+                # Format: (property (name "X") (value "Y"))
+                pname_node = _child(prop, 'name')
+                pval_node  = _child(prop, 'value')
+                if not pname_node or len(pname_node) < 2:
+                    continue
+                pname = pname_node[1]
+                pval  = pval_node[1] if pval_node and len(pval_node) > 1 else ''
+                if not isinstance(pname, str):
+                    continue
+                if pname == 'Sheetfile':
+                    sheetfile = pval
+                elif pname == 'Sheetname':
+                    sheetname = pval
+                elif pname not in ('ki_keywords', 'ki_fp_filters', 'ki_description',
+                                   'Intersheetrefs'):
+                    if isinstance(pval, str):
+                        custom[pname] = pval
+
+            # Fields section for footprint, datasheet
+            fields_node = _child(comp, 'fields')
+            if fields_node:
+                for field in _children(fields_node, 'field'):
+                    name_node = _child(field, 'name')
+                    fname = name_node[1] if name_node and len(name_node) > 1 else ''
+                    fval = field[2] if len(field) > 2 else ''
+                    if isinstance(fval, list):
+                        fval = ''
+                    if fname == 'Footprint':
+                        footprint = fval
+                    elif fname == 'Datasheet':
+                        datasheet = fval
+                    elif fname == 'Description' and not description:
+                        description = fval
+                    elif fname not in ('Reference', 'Value', 'Footprint',
+                                       'Datasheet', 'Description'):
+                        if fval:
+                            custom.setdefault(fname, fval)
+
+            # Determine sheet for rename lookup
+            sname_clean = os.path.splitext(sheetfile)[0] if sheetfile else ''
+            ref_to_sheet[orig_ref] = sname_clean
+            sheet_display = sheetfile or 'unknown.kicad_sch'
+
+            comp_meta[orig_ref] = {
+                'value': value,
+                'footprint': footprint,
+                'sheet': sheet_display,
+                'sheet_name': sname_clean,
+                'description': description,
+                'datasheet': datasheet,
+                'properties': custom,
+                '_orig_ref': orig_ref,
+            }
+
+    # Apply rename map to components
+    # Build ref_to_renamed: orig_ref -> final_ref
+    # We need the sheet_name per component to look up in rename map
+    ref_to_renamed: Dict[str, str] = {}
     components: Dict[str, dict] = {}
-    seen_comps: Set[str] = set()
+    for orig_ref, meta in comp_meta.items():
+        sname = meta['sheet_name']
+        new_ref = rename.get((orig_ref, sname), orig_ref)
+        ref_to_renamed[orig_ref] = new_ref
+        comp_out = {k: v for k, v in meta.items()
+                    if not k.startswith('_') and k != 'sheet_name'}
+        components[new_ref] = comp_out
 
-    for sheet in all_sheets:
-        sheet_name = sheet['sheet_name']
-        lib_syms = sheet['lib_symbols']
+    # Parse nets section
+    nets: Dict[str, List[dict]] = {}
+    nets_node = _child(nl, 'nets')
+    if nets_node:
+        for net in _children(nets_node, 'net'):
+            name_node = _child(net, 'name')
+            raw_name = name_node[1] if name_node and len(name_node) > 1 else ''
+            net_name = _normalize_net_name(raw_name)
 
-        def _ref(original: str) -> str:
-            return rename.get((original, sheet_name), original)
+            for node in _children(net, 'node'):
+                ref_node = _child(node, 'ref')
+                pin_node = _child(node, 'pin')
+                pf_node  = _child(node, 'pinfunction')
+                pt_node  = _child(node, 'pintype')
 
-        # Collect component metadata
-        for inst in sheet['instances']:
-            orig_ref = inst['reference']
-            if any(orig_ref.startswith(p) for p in _PWR_REF_PREFIXES):
-                continue
-            lib_sym = lib_syms.get(inst['lib_id'], {})
-            if lib_sym.get('is_power', False):
-                continue
-            ref = _ref(orig_ref)
-            if ref in seen_comps:
-                continue
-            seen_comps.add(ref)
-            components[ref] = {
-                'value': inst['value'],
-                'footprint': inst['footprint'],
-                'sheet': sheet_name + '.kicad_sch',
-                'description': inst['description'],
-                'datasheet': inst['datasheet'],
-                'properties': inst['properties'],
-            }
+                orig_ref = ref_node[1] if ref_node and len(ref_node) > 1 else ''
+                pin_num  = pin_node[1] if pin_node and len(pin_node) > 1 else ''
+                pf_raw   = pf_node[1]  if pf_node  and len(pf_node)  > 1 else ''
+                pin_type = pt_node[1]  if pt_node  and len(pt_node)  > 1 else ''
 
-        # Collect pin→net mappings
-        for pin in sheet['pin_data']:
-            entry = {
-                'ref': _ref(pin['reference']),
-                'pin': pin['pin_number'],
-                'pin_name': pin['pin_name'],
-                'pin_type': pin['pin_type'],
-            }
-            nets.setdefault(pin['net_name'], []).append(entry)
+                pin_name = _strip_pin_num(pf_raw, pin_num)
+                ref = ref_to_renamed.get(orig_ref, orig_ref)
 
-    # Merge nets that are connected through hierarchical bus sheet pins
-    _apply_bus_merges(nets, all_sheets)
+                # Classify the pin
+                if 'no_connect' in pin_type:
+                    target = '__FNC__'
+                elif net_name.startswith('unconnected-'):
+                    target = '__NC__'
+                else:
+                    target = net_name
+
+                nets.setdefault(target, []).append({
+                    'ref': ref,
+                    'pin': pin_num,
+                    'pin_name': pin_name,
+                    'pin_type': pin_type.replace('+no_connect', '').strip('+'),
+                })
 
     return {'nets': nets, 'components': components}
 
 
-def _apply_bus_merges(nets: dict, all_sheets: List[dict]) -> None:
+# ---------------------------------------------------------------------------
+# Build final netlist (orchestrates kicad-cli + schematic context)
+# ---------------------------------------------------------------------------
+
+def _build_netlist(all_sheets: List[dict]) -> dict:
     """
-    Find cross-sheet bus connections and merge the individual member nets
-    in-place.  Example: "DQ0" (processor sheet) and "DDR_DQ0" (DDR3 sheet)
-    are connected through the bus sheet pins DQ[0..15] ↔ DDR_DQ[0..15] in
-    the parent sheet; they become one net.
+    Build the final netlist dict.
+
+    Connectivity comes from kicad-cli (authoritative).
+    Component descriptions and custom properties are supplemented from
+    schematic traversal data where the netlist field is empty.
     """
-    merge_pairs = _build_bus_merge_pairs(all_sheets)
-    if not merge_pairs:
-        return
+    if not all_sheets:
+        return {'nets': {}, 'components': {}}
 
-    # Union-find over net name strings
-    net_uf = _UF()
-    for net_a, net_b in merge_pairs:
-        net_uf.ensure(net_a)
-        net_uf.ensure(net_b)
-        net_uf.union(net_a, net_b)
+    rename = _make_rename_map(all_sheets)
+    root_path = all_sheets[0]['path']
 
-    # Canonical name for each component: alphabetically first (deterministic)
-    comp_canonical: Dict[object, str] = {}
-    for name in list(net_uf._p):
-        root = net_uf.find(name)
-        if root not in comp_canonical or name < comp_canonical[root]:
-            comp_canonical[root] = name
+    # Export and parse the KiCad netlist
+    netlist_path = _export_netlist(root_path)
+    try:
+        result = _parse_kicad_netlist(netlist_path, rename)
+    finally:
+        try:
+            os.unlink(netlist_path)
+        except OSError:
+            pass
 
-    def _canonical(name: str) -> str:
-        if name not in net_uf._p:
-            return name
-        return comp_canonical.get(net_uf.find(name), name)
-
-    # Rebuild nets dict with merged names
-    merged: Dict[str, list] = {}
-    for net_name, pins in list(nets.items()):
-        merged.setdefault(_canonical(net_name), []).extend(pins)
-    nets.clear()
-    nets.update(merged)
-
-
-def _build_bus_merge_pairs(all_sheets: List[dict]) -> List[Tuple[str, str]]:
-    """
-    For each parent sheet, find pairs of bus-type sheet pins that are
-    connected by a bus wire.  Return (net_a, net_b) merge pairs derived
-    from the child sheets' bus_member_maps.
-    """
-    sheet_by_file: Dict[str, dict] = {
-        os.path.basename(s['path']): s for s in all_sheets
-    }
-
-    merge_pairs: List[Tuple[str, str]] = []
-
+    # Supplement component metadata from schematic traversal
+    # (fill in description/properties that may be richer in the schematic)
+    sch_meta: Dict[str, dict] = {}
     for sheet in all_sheets:
-        buses = sheet.get('buses', [])
-        if not buses:
-            continue
-        bus_entries = sheet.get('bus_entries', [])
-        sheet_refs = sheet.get('sheet_refs', [])
+        sname = sheet['sheet_name']
+        for inst in sheet['instances']:
+            orig_ref = inst['reference']
+            new_ref = rename.get((orig_ref, sname), orig_ref)
+            if new_ref not in sch_meta:
+                sch_meta[new_ref] = inst
 
-        # Collect bus-type sheet pins: pos → (child_filename, pin_name)
-        bus_pins: Dict[Tuple, Tuple[str, str]] = {}
-        for ref in sheet_refs:
-            for pin in ref['pins']:
-                if _parse_bus_label(pin['name']):
-                    bus_pins[pin['pos']] = (ref['filename'], pin['name'])
+    for ref, comp in result['components'].items():
+        src = sch_meta.get(ref, {})
+        if not comp.get('description') and src.get('description'):
+            comp['description'] = src['description']
+        if not comp.get('datasheet') and src.get('datasheet'):
+            comp['datasheet'] = src['datasheet']
+        for k, v in src.get('properties', {}).items():
+            comp['properties'].setdefault(k, v)
 
-        if len(bus_pins) < 2:
-            continue
-
-        # Build bus UF for this parent sheet and connect sheet pin positions
-        bus_uf = _UF()
-        for p1, p2 in buses:
-            bus_uf.ensure(p1); bus_uf.ensure(p2); bus_uf.union(p1, p2)
-        for bs, ws in bus_entries:
-            bus_uf.ensure(bs); bus_uf.ensure(ws); bus_uf.union(bs, ws)
-        for pos in bus_pins:
-            _connect_point_to_wires(pos, buses, bus_uf)
-
-        # Group sheet pins by bus component
-        comp_to_pins: Dict[object, list] = defaultdict(list)
-        for pos, (filename, pin_name) in bus_pins.items():
-            if pos in bus_uf._p:
-                comp_to_pins[bus_uf.root(pos)].append((filename, pin_name))
-
-        # For each connected group, retrieve member maps and emit merge pairs
-        for _comp, group in comp_to_pins.items():
-            if len(group) < 2:
-                continue
-            maps: List[Dict[int, str]] = []
-            for filename, pin_name in group:
-                child = sheet_by_file.get(filename)
-                if not child:
-                    continue
-                m = child.get('bus_member_maps', {}).get(pin_name)
-                if m:
-                    maps.append(m)
-
-            if len(maps) < 2:
-                continue
-
-            ref_map = maps[0]
-            for other_map in maps[1:]:
-                for idx, net_a in ref_map.items():
-                    net_b = other_map.get(idx)
-                    if net_b and net_b != net_a:
-                        merge_pairs.append((net_a, net_b))
-
-    return merge_pairs
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1034,12 +610,14 @@ def main():
     except FileNotFoundError as e:
         print(f'Error: {e}', file=sys.stderr)
         sys.exit(1)
+    except RuntimeError as e:
+        print(f'Error: {e}', file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f'Error parsing schematic: {e}', file=sys.stderr)
         raise
 
     output = json.dumps(netlist, indent=2)
-
     if args.output:
         with open(args.output, 'w', encoding='utf-8') as f:
             f.write(output)

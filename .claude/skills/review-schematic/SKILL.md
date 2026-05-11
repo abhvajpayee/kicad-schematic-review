@@ -1,6 +1,6 @@
 ---
 name: review-schematic
-description: Reviews a KiCad schematic hierarchy for design errors, then cross-references findings against component datasheets to produce specific fix recommendations. Parses all sheets, resolves net connectivity including hierarchical bus connections, fetches and saves datasheets, and reports floating inputs, undriven nets, single-pin nets, missing footprints, and duplicate references — with datasheet-backed suggestions grouped by sheet. Use when the user wants to audit a schematic, check for connectivity issues, review DDR/interface connections, or prepare a design for layout.
+description: Reviews a KiCad schematic hierarchy for design errors, then cross-references findings against component datasheets to produce specific fix recommendations. Uses kicad-cli for authoritative net connectivity, fetches and saves datasheets, and reports floating inputs, undriven nets, single-pin nets, missing footprints, and duplicate references — with datasheet-backed suggestions grouped by sheet. Use when the user wants to audit a schematic, check for connectivity issues, review DDR/interface connections, or prepare a design for layout.
 ---
 
 # Review Schematic
@@ -26,7 +26,7 @@ python review_schematic.py <path> --output /tmp/review.json
 python review_schematic.py <path> --format text
 ```
 
-Auto-detects the root sheet from a directory. Traverses the full hierarchy. Typical runtime under 1 second.
+Auto-detects the root sheet from a directory. Calls `kicad-cli` internally for connectivity — requires KiCad 7+ on PATH. Typical runtime 2–5 seconds (kicad-cli startup dominates).
 
 To query specific nets after the review:
 ```bash
@@ -38,6 +38,11 @@ for p in nets.get('NET_NAME', []):
     print(p)
 "
 ```
+
+Net names match KiCad's internal naming with the sheet path prefix stripped:
+- `/Ethernet/ETH0_7`  →  `ETH0_7`
+- `Net-(U10-MDC)`     →  `Net-(U10-MDC)`  (unnamed nets keep KiCad's anchor name)
+- `unconnected-(...)` →  classified as `__NC__` automatically
 
 ---
 
@@ -237,16 +242,25 @@ Duplicate refs across sheets are **auto-renamed** with a sheet prefix in the net
 
 ---
 
-## Step 8: Bus False-Positive Classification
+## Step 8: Net Name Conventions
 
-| Net name pattern | Resolution status | Action |
+kicad-cli strips hierarchical path prefixes in the netlist. After `_normalize_net_name`:
+
+| Raw KiCad net name | Displayed as | Meaning |
 |---|---|---|
-| `DDR_DQ*`, `DDR_A*`, `DDR_BA*`, `DDR_CTRL*` | ✅ Resolved | Real issue if single-pin |
-| `DDR_CKE`, `DDR_ODT`, `DDR_~{RAS}`, `DDR_~{CAS}` | ✅ Resolved | Real issue if single-pin |
-| `ETH0_*`, `JTAG*`, `SDMMC1_*` (numeric suffix) | ✅ Resolved | Real issue if single-pin |
-| `USART*`, `SPI*`, `I2C*`, `BT_*`, `WL_*`, `SDIO_*` | ⚠️ Not resolved | Likely artifact — verify manually |
-| `USB*_N`, `USB*_P` | ⚠️ Not resolved | Likely artifact |
-| `PD_*`, `PA_*`, `PH_*` (GPIO banks) | ⚠️ Not resolved | Likely artifact |
+| `/GND` | `GND` | Global net |
+| `/Ethernet/ETH0_7` | `ETH0_7` | Local net in Ethernet sheet |
+| `Net-(U10-MDC)` | `Net-(U10-MDC)` | Unnamed net anchored to U10 MDC pin |
+| `unconnected-(U10-RSET-Pad39)` | `__NC__` | Truly floating pin |
+| pin with `pintype "input+no_connect"` | `__FNC__` | Explicit no-connect marker |
+
+Single-pin net false-positive patterns (hierarchical bus signals with no partner on the local sheet):
+
+| Pattern | Likely artifact | Action |
+|---|---|---|
+| `ETH0_*`, `DDR_*`, `SDMMC*` with numeric suffix | Bus member, other end on different sheet | Cross-check against both chips |
+| `USART*`, `SPI*`, `I2C*`, `BT_*` | Peripheral signal, other end on processor sheet | Verify manually in schematic |
+| `USB*_N`, `USB*_P`, `PA_*`, `PB_*` (GPIO banks) | Same as above | Verify manually |
 
 ---
 
@@ -267,26 +281,7 @@ for net, pins in nets.items():
         print(f"BROKEN: {net} → only {refs}")
 ```
 
-All signals below should connect both the processor and the DDR3 chip:
-
-| Signal | Net name | Function |
-|---|---|---|
-| Clock pair | `DDR_CTRL0`, `DDR_CTRL1` | CK+, CK− |
-| CKE | `DDR_CTRL2` or `DDR_CKE` | Clock Enable |
-| ~RESET | `DDR_CTRL3` | Reset |
-| ~CS | `DDR_CTRL4` | Chip Select |
-| ~RAS | `DDR_CTRL5` or `DDR_~{RAS}` | Row Strobe |
-| ~CAS | `DDR_CTRL6` or `DDR_~{CAS}` | Column Strobe |
-| ~WE | `DDR_CTRL7` | Write Enable |
-| ODT | `DDR_CTRL8` or `DDR_ODT` | On-Die Termination |
-| LDM | `DDR_CTRL9` | Lower Data Mask |
-| UDM | `DDR_CTRL10` or `DDR_UDM` | Upper Data Mask |
-| LDQS+/− | `DDR_CTRL11`, `DDR_CTRL12` or `DDR_LDQS_*` | Lower Strobe |
-| UDQS+/− | `DDR_CTRL13`, `DDR_CTRL14` | Upper Strobe |
-| Data | `DDR_DQ0`–`DDR_DQ15` | 16-bit data bus |
-| Address | `DDR_A0`–`DDR_A15`, `DDR_BA0`–`DDR_BA2` | Address / bank |
-
-A single-ref net here is a real disconnection — check for label name mismatch (most common: wire carries both a functional label and a bus-indexed label, parser picks the wrong canonical name on one side).
+All signals below should connect both the processor and the DDR3 chip. Net names reflect KiCad's internal naming after path-prefix stripping — check the actual schematic if a net name seems unexpected.
 
 ---
 
@@ -294,47 +289,44 @@ A single-ref net here is a real disconnection — check for label name mismatch 
 
 ```
 Schematic: STM32MP1.kicad_sch
-Sheets: 10  |  Components: 291  |  Named nets: 276
-Total findings: 146  (critical: 41, warnings: 105)
-Datasheets fetched: 4  (saved to STM32MP1/datasheets/)
+Sheets: 10  |  Components: 294  |  Named nets: 370
+Total findings: 116  (critical: X, warnings: Y)
+Datasheets fetched: 1  (saved to STM32MP1/datasheets/)
 
 ## Ethernet.kicad_sch  (13 findings)
 
-### Floating Inputs (9)
+### Undriven Nets (13)
 
-U10 pin 36 (XTAL_IN) [__NC__]
-  ↳ [RTL8211F-CG datasheet §4.3] Crystal or clock input. Options:
-    a) 25 MHz ±20 ppm crystal + two 10–22 pF load caps to GND
-    b) External 25 MHz CMOS oscillator
-    c) 10 Ω to GND if using CLKSEL = HIGH with external clock on XTAL_OUT
+Net-(U10-XTAL_IN): R137.1, U10.36
+  ↳ [RTL8211F-CG §10.3] XTAL_IN must be tied to GND via 10 Ω in external-oscillator
+    mode. Currently routed to processor ETH_CLK via R137/R138 — replace with GND.
 
-U10 pin 13 (MDC) [__NC__]
-  ↳ [RTL8211F-CG datasheet §5.2] MDIO Management Clock — must be driven by
-    MAC/processor at ≤ 2.5 MHz. Leaving floating disables PHY management
-    interface; cannot read/write PHY registers.
+Net-(U10-MDC): R130.1, U10.13
+  ↳ [RTL8211F-CG §7.11.2] MDC driven by MAC (ETH_MDC net via R130). Net between
+    R130 and U10 has no driver — this is the series resistor connection, not an error.
+    Mark as info if confirmed series resistor is intentional.
 
 ## Action Items
 
 1. 🔴 [Critical] Fix 41 duplicate references — re-annotate schematic
-2. 🔴 [Critical] Connect U10 XTAL_IN: 25 MHz crystal with 10–22 pF load caps
-3. 🔴 [High]     Connect U10 RGMII Tx (TXD0–TXD3, TXCTL, TXC) from STM32 RGMII
-4. 🔴 [High]     Connect U10 MDC/MDIO management interface from STM32
-5. 🟡 [Medium]   Verify DDR3_RAM ZQ resistor = 240 Ω ±1% (AS4C256M16D3 Table 25)
-6. 🟡 [Medium]   Verify peripheral bus wiring (USART2, SPI5, I2C) in root schematic
+2. 🔴 [Critical] Fix KC2520Z (Ethernet_U5): VCC shorted to GND; INH floating
+3. 🔴 [Critical] Connect XTAL_IN (U10 pin 36) to GND via 10 Ω (external-oscillator mode)
+4. 🔴 [Critical] Add 12.1 kΩ ±1% from U10 RSET (pin 39) to GND
+5. 🔴 [High]     Connect 3V3 to L9/L10 — AVDD33/DVDD33 are undriven
+6. 🟡 [Medium]   Verify R120/R121/R122: one pad on 3V3_DVDD_GMII (may short signal to supply)
 ```
 
 ---
 
-## Parser Resolution Reference
+## Connectivity source
 
-### Resolved correctly ✅
-- Regular wires and labels within a sheet
-- Global labels (same name on any sheet = same net)
-- Hierarchical buses with numeric-suffix members (`DDR_DQ[0..15]`, `DDR_CTRL[0..14]`, etc.)
-- Wires with dual labels (functional + bus-indexed on same wire — both tried for index)
-- Split hierarchical labels (same bus on left/right sides of a large chip symbol — merged)
-- Duplicate refs — auto-renamed with sheet prefix
+Connectivity comes from `kicad-cli sch export netlist --format kicadsexpr`. This is KiCad's own netlist — the same data ERC and PCB layout use. All cross-sheet and hierarchical connections are resolved correctly by KiCad.
 
-### Known remaining limitations ⚠️
-- Named-suffix buses (`USART2_TX`, `SPI5_MOSI`, `I2C1_SDA`, `BT_TXD`) — positional bus matching not yet implemented
-- Net-tie / zero-ohm resistor connections not traced
+The `.kicad_sch` files are parsed only for:
+- Component descriptions and custom properties (MPN, manufacturer) not always in the netlist
+- Duplicate-reference detection (scanning per-sheet symbol instances)
+
+**Pin classification:**
+- `pintype "input+no_connect"` in the netlist → `__FNC__` (explicit no-connect marker)
+- Net name `unconnected-(ref-pinname-padN)` → `__NC__` (genuinely floating, no connection)
+- Anything else → named net (path prefix stripped)

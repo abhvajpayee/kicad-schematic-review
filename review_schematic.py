@@ -24,7 +24,7 @@ import sys
 from collections import defaultdict
 from typing import Dict, List
 
-from parse_schematic import _find_root, _traverse, _build_netlist, _make_rename_map
+from parse_schematic import _find_root, _traverse, _build_netlist, _make_rename_map  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
