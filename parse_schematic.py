@@ -455,13 +455,20 @@ def _compute_bus_member_maps(
     bus_entries: List[Tuple],
     wire_uf: '_UF',
     comp_names: dict,
+    comp_labels: dict,
     wires: List[Tuple],
 ) -> Dict[str, Dict[int, str]]:
     """
     For each hierarchical_label with a bus name (e.g. "DDR_DQ[0..15]"), find
     which individual net name occupies each bus member index.
 
-    Returns: {hier_label_name → {member_index → net_name}}
+    comp_labels carries ALL label names on each wire component, not just the
+    canonical one.  This lets us find a bus-indexed label (e.g. "DDR_CTRL2")
+    even when the canonical name for that wire is a functional alias (e.g.
+    "DDR_CKE") — a common pattern where designers annotate wires with both
+    forms for readability.
+
+    Returns: {hier_label_name → {member_index → canonical_net_name}}
     """
     # Build a bus-only union-find (buses + bus_entries as edges)
     bus_uf = _UF()
@@ -500,16 +507,35 @@ def _compute_bus_member_maps(
             # wire_side is a wire endpoint — connect it into the wire UF and
             # look up which net it belongs to
             _connect_point_to_wires(wire_side, wires, wire_uf)
-            info = comp_names.get(wire_uf.root(wire_side))
+            wire_root = wire_uf.root(wire_side)
+            info = comp_names.get(wire_root)
             if not info:
                 continue
-            net_name = info[0]
-            idx = _label_bus_index(net_name, base, low, high)
+            canonical = info[0]
+
+            # Try the canonical name first, then every other label on this
+            # wire.  This handles wires with dual annotations like
+            # DDR_CKE + DDR_CTRL2 on the same wire: the canonical name may
+            # be the functional one ("DDR_CKE") which carries no bus index,
+            # but one of the other labels ("DDR_CTRL2") does.
+            all_names = comp_labels.get(wire_root, [canonical])
+            idx = None
+            for name in [canonical] + [n for n in all_names if n != canonical]:
+                idx = _label_bus_index(name, base, low, high)
+                if idx is not None:
+                    break
+
             if idx is not None:
-                member_map[idx] = net_name
+                member_map[idx] = canonical  # always store canonical net name
 
         if member_map:
-            result[lbl['name']] = member_map
+            # Merge rather than overwrite: a single bus may span multiple
+            # hierarchical_label nodes (e.g. DDR_CTRL[0..14] appears on both
+            # the left and right sides of a wide BGA chip symbol).
+            if lbl['name'] in result:
+                result[lbl['name']].update(member_map)
+            else:
+                result[lbl['name']] = member_map
 
     return result
 
@@ -588,9 +614,13 @@ def _resolve_nets(instances, lib_symbols, wires, labels, nc_positions):
     for pos in nc_positions:
         _connect_point_to_wires(pos, wires, uf)
 
-    # Assign names to connected components
-    # comp_root → (name, priority)
+    # Assign names to connected components.
+    # comp_names  → canonical name (highest-priority label, used for final net names)
+    # comp_labels → all label names on each component (used by bus member resolution
+    #               so it can find a bus-indexed name even when the canonical name is
+    #               a functional alias like "DDR_CKE" instead of "DDR_CTRL2")
     comp_names: Dict[object, Tuple[str, int]] = {}
+    comp_labels: Dict[object, List[str]] = defaultdict(list)
 
     for lbl in labels:
         root = uf.root(lbl['pos'])
@@ -598,6 +628,7 @@ def _resolve_nets(instances, lib_symbols, wires, labels, nc_positions):
         existing = comp_names.get(root)
         if existing is None or pri > existing[1]:
             comp_names[root] = (lbl['name'], pri)
+        comp_labels[root].append(lbl['name'])
 
     # Power symbols: treat Value as a label at the pin position
     for inst in instances:
@@ -658,7 +689,7 @@ def _resolve_nets(instances, lib_symbols, wires, labels, nc_positions):
                 'net_name': net_name,
             })
 
-    return pin_data, uf, comp_names
+    return pin_data, uf, comp_names, comp_labels
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +706,10 @@ def _parse_sheet(path: str, sheet_name: str) -> dict:
     labels = _extract_labels(sch)
     nc_positions = _extract_no_connects(sch)
     sheet_refs = _extract_sheet_refs(sch)
-    pin_data, wire_uf, comp_names = _resolve_nets(
+    pin_data, wire_uf, comp_names, comp_labels = _resolve_nets(
         instances, lib_syms, wires, labels, nc_positions)
     bus_member_maps = _compute_bus_member_maps(
-        labels, buses, bus_entries, wire_uf, comp_names, wires)
+        labels, buses, bus_entries, wire_uf, comp_names, comp_labels, wires)
 
     return {
         'path': os.path.abspath(path),
