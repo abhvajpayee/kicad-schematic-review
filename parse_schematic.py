@@ -37,7 +37,9 @@ Output schema:
 import json
 import math
 import os
+import re
 import sys
+from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
@@ -380,6 +382,138 @@ def _extract_no_connects(sch: list) -> Set[Tuple]:
     return ncs
 
 
+def _extract_buses(sch: list) -> List[Tuple]:
+    """Extract bus wire segments — same coordinate format as regular wires."""
+    buses = []
+    for bus in _children(sch, 'bus'):
+        pts = _child(bus, 'pts')
+        if not pts:
+            continue
+        xys = _children(pts, 'xy')
+        if len(xys) < 2:
+            continue
+        buses.append((_key(float(xys[0][1]), float(xys[0][2])),
+                      _key(float(xys[1][1]), float(xys[1][2]))))
+    return buses
+
+
+def _extract_bus_entries(sch: list) -> List[Tuple]:
+    """
+    Extract bus_entry stubs as (bus_side, wire_side) pairs.
+    KiCad convention: 'at' = the point that touches the bus wire,
+    'at + size' = the point that touches the individual signal wire.
+    """
+    entries = []
+    for be in _children(sch, 'bus_entry'):
+        at = _child(be, 'at')
+        size = _child(be, 'size')
+        if not at or not size or len(at) < 3 or len(size) < 3:
+            continue
+        x, y = float(at[1]), float(at[2])
+        dx, dy = float(size[1]), float(size[2])
+        entries.append((_key(x, y), _key(x + dx, y + dy)))
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Bus member resolution
+# ---------------------------------------------------------------------------
+
+_BUS_RANGE_RE = re.compile(r'^(.+)\[(\d+)\.\.(\d+)\]$')
+
+
+def _parse_bus_label(name: str) -> Optional[Tuple[str, int, int]]:
+    """Parse "Base[low..high]" → (base, low, high), or None if not a bus name."""
+    m = _BUS_RANGE_RE.match(name)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), int(m.group(3))
+
+
+def _label_bus_index(label_name: str, base: str, low: int, high: int) -> Optional[int]:
+    """
+    If label_name is a member of base[low..high], return its 0-based index.
+    Example: "DDR_DQ5" in "DDR_DQ[0..15]" → 5.
+    """
+    if not label_name.startswith(base):
+        return None
+    suffix = label_name[len(base):]
+    try:
+        num = int(suffix)
+        if low <= high and low <= num <= high:
+            return num - low
+        if low > high and high <= num <= low:
+            return low - num
+    except ValueError:
+        pass
+    return None
+
+
+def _compute_bus_member_maps(
+    labels: list,
+    buses: List[Tuple],
+    bus_entries: List[Tuple],
+    wire_uf: '_UF',
+    comp_names: dict,
+    wires: List[Tuple],
+) -> Dict[str, Dict[int, str]]:
+    """
+    For each hierarchical_label with a bus name (e.g. "DDR_DQ[0..15]"), find
+    which individual net name occupies each bus member index.
+
+    Returns: {hier_label_name → {member_index → net_name}}
+    """
+    # Build a bus-only union-find (buses + bus_entries as edges)
+    bus_uf = _UF()
+    for p1, p2 in buses:
+        bus_uf.ensure(p1)
+        bus_uf.ensure(p2)
+        bus_uf.union(p1, p2)
+    for bus_side, wire_side in bus_entries:
+        bus_uf.ensure(bus_side)
+        bus_uf.ensure(wire_side)
+        bus_uf.union(bus_side, wire_side)
+
+    # Connect hierarchical bus label positions to the bus UF
+    for lbl in labels:
+        if lbl['kind'] == 'hierarchical_label' and _parse_bus_label(lbl['name']):
+            _connect_point_to_wires(lbl['pos'], buses, bus_uf)
+
+    result: Dict[str, Dict[int, str]] = {}
+
+    for lbl in labels:
+        if lbl['kind'] != 'hierarchical_label':
+            continue
+        parsed = _parse_bus_label(lbl['name'])
+        if not parsed:
+            continue
+        base, low, high = parsed
+        pos = lbl['pos']
+        if pos not in bus_uf._p:
+            continue
+        bus_comp = bus_uf.root(pos)
+
+        member_map: Dict[int, str] = {}
+        for bus_side, wire_side in bus_entries:
+            if bus_uf.root(bus_side) != bus_comp:
+                continue
+            # wire_side is a wire endpoint — connect it into the wire UF and
+            # look up which net it belongs to
+            _connect_point_to_wires(wire_side, wires, wire_uf)
+            info = comp_names.get(wire_uf.root(wire_side))
+            if not info:
+                continue
+            net_name = info[0]
+            idx = _label_bus_index(net_name, base, low, high)
+            if idx is not None:
+                member_map[idx] = net_name
+
+        if member_map:
+            result[lbl['name']] = member_map
+
+    return result
+
+
 def _extract_sheet_refs(sch: list) -> List[dict]:
     refs = []
     for sheet in _children(sch, 'sheet'):
@@ -524,7 +658,7 @@ def _resolve_nets(instances, lib_symbols, wires, labels, nc_positions):
                 'net_name': net_name,
             })
 
-    return pin_data
+    return pin_data, uf, comp_names
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +670,15 @@ def _parse_sheet(path: str, sheet_name: str) -> dict:
     lib_syms = _extract_lib_symbols(sch)
     instances = _extract_instances(sch)
     wires = _extract_wires(sch)
+    buses = _extract_buses(sch)
+    bus_entries = _extract_bus_entries(sch)
     labels = _extract_labels(sch)
     nc_positions = _extract_no_connects(sch)
     sheet_refs = _extract_sheet_refs(sch)
-    pin_data = _resolve_nets(instances, lib_syms, wires, labels, nc_positions)
+    pin_data, wire_uf, comp_names = _resolve_nets(
+        instances, lib_syms, wires, labels, nc_positions)
+    bus_member_maps = _compute_bus_member_maps(
+        labels, buses, bus_entries, wire_uf, comp_names, wires)
 
     return {
         'path': os.path.abspath(path),
@@ -548,6 +687,9 @@ def _parse_sheet(path: str, sheet_name: str) -> dict:
         'lib_symbols': lib_syms,
         'pin_data': pin_data,
         'sheet_refs': sheet_refs,
+        'buses': buses,
+        'bus_entries': bus_entries,
+        'bus_member_maps': bus_member_maps,
     }
 
 
@@ -624,7 +766,6 @@ def _make_rename_map(all_sheets: List[dict]) -> Dict[tuple, str]:
 
     Returns: {(original_ref, sheet_name): disambiguated_ref}
     """
-    from collections import defaultdict
     ref_unit_sheets: Dict[tuple, List[str]] = defaultdict(list)
 
     for sheet in all_sheets:
@@ -702,7 +843,118 @@ def _build_netlist(all_sheets: List[dict]) -> dict:
             }
             nets.setdefault(pin['net_name'], []).append(entry)
 
+    # Merge nets that are connected through hierarchical bus sheet pins
+    _apply_bus_merges(nets, all_sheets)
+
     return {'nets': nets, 'components': components}
+
+
+def _apply_bus_merges(nets: dict, all_sheets: List[dict]) -> None:
+    """
+    Find cross-sheet bus connections and merge the individual member nets
+    in-place.  Example: "DQ0" (processor sheet) and "DDR_DQ0" (DDR3 sheet)
+    are connected through the bus sheet pins DQ[0..15] ↔ DDR_DQ[0..15] in
+    the parent sheet; they become one net.
+    """
+    merge_pairs = _build_bus_merge_pairs(all_sheets)
+    if not merge_pairs:
+        return
+
+    # Union-find over net name strings
+    net_uf = _UF()
+    for net_a, net_b in merge_pairs:
+        net_uf.ensure(net_a)
+        net_uf.ensure(net_b)
+        net_uf.union(net_a, net_b)
+
+    # Canonical name for each component: alphabetically first (deterministic)
+    comp_canonical: Dict[object, str] = {}
+    for name in list(net_uf._p):
+        root = net_uf.find(name)
+        if root not in comp_canonical or name < comp_canonical[root]:
+            comp_canonical[root] = name
+
+    def _canonical(name: str) -> str:
+        if name not in net_uf._p:
+            return name
+        return comp_canonical.get(net_uf.find(name), name)
+
+    # Rebuild nets dict with merged names
+    merged: Dict[str, list] = {}
+    for net_name, pins in list(nets.items()):
+        merged.setdefault(_canonical(net_name), []).extend(pins)
+    nets.clear()
+    nets.update(merged)
+
+
+def _build_bus_merge_pairs(all_sheets: List[dict]) -> List[Tuple[str, str]]:
+    """
+    For each parent sheet, find pairs of bus-type sheet pins that are
+    connected by a bus wire.  Return (net_a, net_b) merge pairs derived
+    from the child sheets' bus_member_maps.
+    """
+    sheet_by_file: Dict[str, dict] = {
+        os.path.basename(s['path']): s for s in all_sheets
+    }
+
+    merge_pairs: List[Tuple[str, str]] = []
+
+    for sheet in all_sheets:
+        buses = sheet.get('buses', [])
+        if not buses:
+            continue
+        bus_entries = sheet.get('bus_entries', [])
+        sheet_refs = sheet.get('sheet_refs', [])
+
+        # Collect bus-type sheet pins: pos → (child_filename, pin_name)
+        bus_pins: Dict[Tuple, Tuple[str, str]] = {}
+        for ref in sheet_refs:
+            for pin in ref['pins']:
+                if _parse_bus_label(pin['name']):
+                    bus_pins[pin['pos']] = (ref['filename'], pin['name'])
+
+        if len(bus_pins) < 2:
+            continue
+
+        # Build bus UF for this parent sheet and connect sheet pin positions
+        bus_uf = _UF()
+        for p1, p2 in buses:
+            bus_uf.ensure(p1); bus_uf.ensure(p2); bus_uf.union(p1, p2)
+        for bs, ws in bus_entries:
+            bus_uf.ensure(bs); bus_uf.ensure(ws); bus_uf.union(bs, ws)
+        for pos in bus_pins:
+            _connect_point_to_wires(pos, buses, bus_uf)
+
+        # Group sheet pins by bus component
+        comp_to_pins: Dict[object, list] = defaultdict(list)
+        for pos, (filename, pin_name) in bus_pins.items():
+            if pos in bus_uf._p:
+                comp_to_pins[bus_uf.root(pos)].append((filename, pin_name))
+
+        # For each connected group, retrieve member maps and emit merge pairs
+        for _comp, group in comp_to_pins.items():
+            if len(group) < 2:
+                continue
+            maps: List[Dict[int, str]] = []
+            for filename, pin_name in group:
+                child = sheet_by_file.get(filename)
+                if not child:
+                    continue
+                m = child.get('bus_member_maps', {}).get(pin_name)
+                if m:
+                    maps.append(m)
+
+            if len(maps) < 2:
+                continue
+
+            ref_map = maps[0]
+            for other_map in maps[1:]:
+                for idx, net_a in ref_map.items():
+                    net_b = other_map.get(idx)
+                    if net_b and net_b != net_a:
+                        merge_pairs.append((net_a, net_b))
+
+    return merge_pairs
 
 
 # ---------------------------------------------------------------------------
