@@ -1,6 +1,6 @@
 ---
 name: review-schematic
-description: Reviews a KiCad schematic hierarchy for design errors, then cross-references findings against component datasheets to produce specific fix recommendations. Uses kicad-cli for authoritative net connectivity, fetches and saves datasheets, and reports floating inputs, undriven nets, single-pin nets, missing footprints, and duplicate references — with datasheet-backed suggestions grouped by sheet. Use when the user wants to audit a schematic, check for connectivity issues, review DDR/interface connections, or prepare a design for layout.
+description: Reviews a KiCad schematic hierarchy for design errors, then cross-references findings against component datasheets to produce specific fix recommendations. Uses kicad-cli for authoritative net connectivity, runs a kicad-cli ERC mandatory-pin pass to catch unconnected power/passive pins the 5-check DRC misses, fetches and saves datasheets, and reports floating inputs, undriven nets, single-pin nets, missing footprints, and duplicate references — with datasheet-backed suggestions grouped by sheet. Use when the user wants to audit a schematic, check for connectivity issues, review DDR/interface connections, or prepare a design for layout.
 ---
 
 # Review Schematic
@@ -43,6 +43,62 @@ Net names match KiCad's internal naming with the sheet path prefix stripped:
 - `/Ethernet/ETH0_7`  →  `ETH0_7`
 - `Net-(U10-MDC)`     →  `Net-(U10-MDC)`  (unnamed nets keep KiCad's anchor name)
 - `unconnected-(...)` →  classified as `__NC__` automatically
+
+---
+
+## Step 2.5: Mandatory-Pin Pass (kicad-cli ERC) — catches what the 5 checks miss
+
+**The reviewer's "floating inputs" check only flags pins typed `input`.** It does NOT
+catch unconnected **output / passive / power** pins. Real bugs slip through: e.g. an
+LDO's SET / ILIM program resistors left off (passive pins), or mandatory power balls
+unconnected. Always run KiCad's own ERC as a second, authoritative pass:
+
+```bash
+kicad-cli sch erc --severity-error --severity-warning -o /tmp/erc.rpt <root>.kicad_sch
+grep -A2 -E '\[(power_pin_not_driven|pin_not_driven)\]:' /tmp/erc.rpt | grep -E "Symbol|driven"
+grep -A2 '\[pin_not_connected\]:' /tmp/erc.rpt | grep "Symbol U[0-9]"   # ICs only
+```
+
+Triage by violation type:
+
+| ERC type | Meaning | Action |
+|---|---|---|
+| `power_pin_not_driven` | power-input pin with no power-output driver | 🔴 check supply wiring / missing driver |
+| `pin_not_driven` | input pin not driven by any output | check — real gap, or a feedback/strap node |
+| `pin_not_connected` | unconnected pin | filter to `Symbol U*`; judge mandatory vs intentional-NC |
+
+**Ignore these ERC categories** — noise on circuit-synth output, not design errors:
+`endpoint_off_grid`; `lib_symbol_issues` (the `power` lib isn't in the generated
+project's sym-lib-table); `multiple_net_names` / `net_not_bus_member` /
+`isolated_pin_label` (artifacts of `cap_bank`/`resistor_bank` rails and aliased-bus
+dual labels — the exported netlist connectivity is still correct).
+
+---
+
+## Scope and not-a-bug patterns (read before flagging)
+
+- **Footprints are usually out of scope** in the schematic-design phase — every part
+  flags "missing footprint." Confirm with the user; default to focusing on the
+  connectivity/electrical findings, not footprints.
+- **The `value` field may be a role description, not the MPN** (a common house style:
+  `"buck 13.5V"`, `"LT3045 +12V"`, `"ADS8881 18-bit"`). The real part is the symbol
+  `lib_id` plus the BOM — a Value that isn't an MPN is **not** a missing/wrong part.
+- **Undriven-net check counts `power_out` as a driver**, so regulator-fed rails
+  reported "undriven" are false positives. The flip side is a useful symptom: a
+  regulator whose output isn't actually on the rail (e.g. a swapped LDO pinout) shows
+  up as the rail being *undriven* — chase that.
+- **"Representative" design zones:** if the board's source/docstring says a section is
+  representative and finalized in vendor tools (power tree, MCU supply-mode pins),
+  flag concrete gaps as a TODO rather than bugs — **but a hard wiring error (swapped
+  pinout) is a real bug even inside a deferred zone.**
+- **Verify against the datasheet before recommending — don't cry wolf:**
+  - Check for **internal pulls** before recommending external pull resistors on strap
+    pins (e.g. a module BOOT pin often has a weak internal pull-down → no external R).
+  - Vendor-specific / reserved pins may be **correctly NC**: eMMC `VSF` = "Vendor
+    Specific Function, leave floating"; module `RESERVED` = "leave NC"; HS400-only
+    `DS` is unused on an HS200 part.
+  - For an unfamiliar IC, confirm the pin's mandatory connection in the datasheet
+    rather than asserting from the pin name.
 
 ---
 
@@ -168,7 +224,8 @@ If no datasheet section covers the specific pin, still note which sections were 
 ```
 Schematic: <name>
 Sheets: N  |  Components: M  |  Named nets: K
-Total findings: N  (critical: X, warnings: Y)
+DRC findings: N  (critical: X, warnings: Y)   [footprints: F — note if out of scope]
+ERC mandatory-pin (Step 2.5): P power_pin_not_driven, Q pin_not_connected (ICs)
 Datasheets fetched: N
 ```
 
@@ -234,11 +291,13 @@ Duplicate refs across sheets are **auto-renamed** with a sheet prefix in the net
 | Priority | Check | Why |
 |---|---|---|
 | 🔴 Critical | Floating inputs | ESD damage or logic faults |
+| 🔴 Critical | ERC `power_pin_not_driven` (Step 2.5) | mandatory supply pin unconnected — won't power up |
 | 🔴 Critical | Duplicate references | BOM and assembly corruption |
+| 🔴 High | ERC `pin_not_connected` on a *mandatory* IC pin (Step 2.5) | program/feedback pin missing → IC won't work |
 | 🔴 High | Undriven nets (non-bus) | Signal floats at runtime |
 | 🟡 Medium | Single-pin nets (non-bus) | Missing connection |
-| 🟡 Medium | Missing footprint | Blocks PCB layout |
-| ℹ️ Info | Named-suffix bus nets | Parser limitation — verify manually |
+| 🟡 Medium | Missing footprint | Blocks PCB layout (often out of scope pre-layout) |
+| ℹ️ Info | Named-suffix bus nets; ERC off-grid / lib_symbol / multi-name | Parser/generator limitation — verify or ignore |
 
 ---
 
